@@ -2,11 +2,18 @@ import jax
 import jax.numpy as jnp
 import optax
 from time import perf_counter as tpc
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+from torch.nn.functional import softmax, log_softmax
+import numpy as np
 
 
-def protes(f, d, n, m=None, k=100, k_top=10, k_gd=1, lr=5.E-2, r=5, seed=0,
+def protes_gpt(f, model, tokenizer, d, n=10, m=None, n0=34, k=100, k_top=10, k_gd=1, lr=5.E-2, r=5, seed=0,
            is_max=False, log=False, info={}, P=None,
            with_info_i_opt_list=False, with_info_full=False):
+#     assert n == 10
+    
+
     time = tpc()
     info.update({'d': d, 'n': n, 'm_max': m, 'm': 0, 'k': k, 'k_top': k_top,
         'k_gd': k_gd, 'lr': lr, 'r': r, 'seed': seed, 'is_max': is_max,
@@ -20,22 +27,20 @@ def protes(f, d, n, m=None, k=100, k_top=10, k_gd=1, lr=5.E-2, r=5, seed=0,
 
     if P is None:
         rng, key = jax.random.split(rng)
-        P = _generate_initial(d, n, r, key)
+        P = _generate_initial(k, d, n, key)
     elif len(P[1].shape) != 4:
         raise ValueError('Initial P tensor should have special format')
 
     optim = optax.adam(lr)
     state = optim.init(P)
 
-    interface_matrices = jax.jit(_interface_matrices)
-    sample = jax.jit(jax.vmap(_sample, (None, None, None, None, 0)))
-    likelihood = jax.jit(jax.vmap(_likelihood, (None, None, None, None, 0)))
+    sample = jax.jit(jax.vmap(_sample, (None, 0)))
+    likelihood = jax.jit(jax.vmap(_likelihood, (None, 0)))
+
 
     @jax.jit
     def loss(P_cur, I_cur):
-        Pl, Pm, Pr = P_cur
-        Zm = interface_matrices(Pm, Pr)
-        l = likelihood(Pl, Pm, Pr, Zm, I_cur)
+        l = likelihood(P_cur, I_cur)
         return jnp.mean(-l)
 
     loss_grad = jax.grad(loss)
@@ -47,12 +52,20 @@ def protes(f, d, n, m=None, k=100, k_top=10, k_gd=1, lr=5.E-2, r=5, seed=0,
         P_cur = jax.tree_util.tree_map(lambda p, u: p + u, P_cur, updates)
         return state, P_cur
 
-    while True:
-        Pl, Pm, Pr = P
-        Zm = interface_matrices(Pm, Pr)
-        rng, key = jax.random.split(rng)
-        I = sample(Pl, Pm, Pr, Zm, jax.random.split(key, k))
+    I = sample(P[:, 0], jax.random.split(key, k))
 
+    while True:
+        q = np.array(I + n0)
+        q = torch.tensor(q).to(model.device)  # .repeat(k, 1)
+        with torch.no_grad():
+            logits = model(q).logits
+            # digits from 34 to 44
+        P = softmax(logits[:, :, n0:n0+n], dim=-1)
+        # batch x d x n
+
+        rng, key = jax.random.split(rng)
+        P = jnp.array(P.cpu().detach().numpy())
+        I = sample(P[:, 0], jax.random.split(key, k))
         y = f(I)
         if y is None:
             break
@@ -80,50 +93,36 @@ def protes(f, d, n, m=None, k=100, k_top=10, k_gd=1, lr=5.E-2, r=5, seed=0,
     return info['i_opt'], info['y_opt']
 
 
-def _generate_initial(d, n, r, key):
-    """Build initial random TT-tensor for probability."""
-    keyl, keym, keyr = jax.random.split(key, 3)
+def _likelihood(P, I):
 
-    Yl = jax.random.uniform(keyl, (1, n, r))
-    Ym = jax.random.uniform(keym, (d-2, r, n, r))
-    Yr = jax.random.uniform(keyr, (r, n, 1))
+    """Compute the likelihood of sequence i for decicoder model."""
+    y = jnp.cumsum(jax.nn.log_softmax(P, axis=-1), axis=1) #[:, -1]
+    probs = jnp.zeros_like(I)
+    # Y from 0 to 9
+    # try to swap this cycle with jax.lax.scan
+    for i in range(len(I)):
+        probs += y[:, i, I[i]]
 
-    return [Yl, Ym, Yr]
-
-
-def _interface_matrices(Ym, Yr):
-    """Compute the "interface matrices" for the TT-tensor."""
-    def body(Z, Y_cur):
-        Z = jnp.sum(Y_cur, axis=1) @ Z
-        Z /= jnp.linalg.norm(Z)
-        return Z, Z
-
-    Z, Zr = body(jnp.ones(1), Yr)
-    _, Zm = jax.lax.scan(body, Z, Ym, reverse=True)
-
-    return jnp.vstack((Zm, Zr))
+    probs = jnp.array(probs)
+    return probs
 
 
-def _likelihood(Yl, Ym, Yr, Zm, i):
-    """Compute the likelihood in a multi-index i for TT-tensor."""
-    def body(Q, data):
-        I_cur, Y_cur, Z_cur = data
+def _generate_initial(k, d, n,  key):
+    keyl, _ = jax.random.split(key, 2)
+    P = jax.random.uniform(keyl, (k, d, n))
+    return P
 
-        G = jnp.einsum('r,riq,q->i', Q, Y_cur, Z_cur)
-        G = jnp.abs(G)
-        G /= jnp.sum(G)
+def _sample(P, key):
+    print(P[0])
+    i = jax.random.choice(key, jnp.arange(P.shape[-1]), p=P[0], shape=(1,))
+    return i
+# keys=
+# jax.debug
+sample = jax.jit(jax.vmap(_sample, (0, None)))
 
-        Q = jnp.einsum('r,rq->q', Q, Y_cur[:, I_cur, :])
-        Q /= jnp.linalg.norm(Q)
 
-        return Q, G[I_cur]
+# разные keys, разные сэмплы
 
-    Q, yl = body(jnp.ones(1), (i[0], Yl, Zm[0]))
-    Q, ym = jax.lax.scan(body, Q, (i[1:-1], Ym, Zm[1:]))
-    Q, yr = body(Q, (i[-1], Yr, jnp.ones(1)))
-
-    y = jnp.hstack((jnp.array(yl), ym, jnp.array(yr)))
-    return jnp.sum(jnp.log(jnp.array(y)))
 
 
 def _log(info, log=False, is_new=False, is_end=False):
@@ -172,28 +171,4 @@ def _process(P, I, y, info, with_info_i_opt_list, with_info_full):
     return is_new
 
 
-def _sample(Yl, Ym, Yr, Zm, key):
-    """Generate sample according to given probability TT-tensor."""
-    def body(Q, data):
-        key_cur, Y_cur, Z_cur = data
 
-        G = jnp.einsum('r,riq,q->i', Q, Y_cur, Z_cur)
-        G = jnp.abs(G)
-        G /= jnp.sum(G)
-
-        i = jax.random.choice(key_cur, jnp.arange(Y_cur.shape[1]), p=G)
-
-        Q = jnp.einsum('r,rq->q', Q, Y_cur[:, i, :])
-        Q /= jnp.linalg.norm(Q)
-
-        return Q, i
-
-    keys = jax.random.split(key, len(Ym) + 2)
-
-    Q, il = body(jnp.ones(1), (keys[0], Yl, Zm[0]))
-    Q, im = jax.lax.scan(body, Q, (keys[1:-1], Ym, Zm[1:]))
-    Q, ir = body(Q, (keys[-1], Yr, jnp.ones(1)))
-
-    il = jnp.array(il, dtype=jnp.int32)
-    ir = jnp.array(ir, dtype=jnp.int32)
-    return jnp.hstack((il, im, ir))
