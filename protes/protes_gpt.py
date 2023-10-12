@@ -12,13 +12,14 @@ def protes_gpt(f, model, tokenizer, d, n=10, m=None, n0=34, k=100, k_top=10, k_g
            is_max=False, log=False, info={}, P=None,
            with_info_i_opt_list=False, with_info_full=False):
 #     assert n == 10
+    assert k == 1
     
 
     time = tpc()
     info.update({'d': d, 'n': n, 'm_max': m, 'm': 0, 'k': k, 'k_top': k_top,
         'k_gd': k_gd, 'lr': lr, 'r': r, 'seed': seed, 'is_max': is_max,
         'is_rand': P is None, 't': 0, 'i_opt': None, 'y_opt': None,
-        'm_opt_list': [], 'i_opt_list': [], 'y_opt_list': []})
+        'm_opt_list': [], 'i_opt_list': [], 'y_opt_list': [], "ll_list": []})
     if with_info_full:
         info.update({
             'P_list': [], 'I_list': [], 'y_list': []})
@@ -28,13 +29,12 @@ def protes_gpt(f, model, tokenizer, d, n=10, m=None, n0=34, k=100, k_top=10, k_g
     if P is None:
         rng, key = jax.random.split(rng)
         P = _generate_initial(k, d, n, key)
-    elif len(P[1].shape) != 4:
-        raise ValueError('Initial P tensor should have special format')
 
     optim = optax.adam(lr)
     state = optim.init(P)
 
-    sample = jax.jit(jax.vmap(_sample, (None, 0)))
+#     sample = jax.jit(jax.vmap(_sample, (None, 0)))
+    sample = jax.jit(jax.vmap(_sample, (0, 0)))
     likelihood = jax.jit(jax.vmap(_likelihood, (None, 0)))
 
 
@@ -52,27 +52,32 @@ def protes_gpt(f, model, tokenizer, d, n=10, m=None, n0=34, k=100, k_top=10, k_g
         P_cur = jax.tree_util.tree_map(lambda p, u: p + u, P_cur, updates)
         return state, P_cur
 
-    I = sample(P[:, 0], jax.random.split(key, k))
-
+#     I = sample(P[:, 0], jax.random.split(key, k))
+    I = sample(P[0], jax.random.split(key, d))
+    I = I[None, :]
     while True:
-        q = np.array(I + n0)
-        q = torch.tensor(q).to(model.device)  # .repeat(k, 1)
+        q = np.array(I + n0)  # [None, :]
+        q = torch.tensor(q).to(model.device)
         with torch.no_grad():
             logits = model(q).logits
-            # digits from 34 to 44
         P = softmax(logits[:, :, n0:n0+n], dim=-1)
         # batch x d x n
 
         rng, key = jax.random.split(rng)
         P = jnp.array(P.cpu().detach().numpy())
-        I = sample(P[:, 0], jax.random.split(key, k))
+
+#         I = sample(P[:, 0], jax.random.split(key, k))
+        
+        I = sample(P[0], jax.random.split(key, d))[None, :]
         y = f(I)
         if y is None:
             break
 
         y = jnp.array(y)
         info['m'] += y.shape[0]
-
+        l = likelihood(P, I)
+        l = jnp.mean(-l)
+        info["ll_list"].append(l)
         is_new = _process(P, I, y, info, with_info_i_opt_list, with_info_full)
 
         if info['m_max'] and info['m'] >= info['m_max']:
@@ -80,24 +85,26 @@ def protes_gpt(f, model, tokenizer, d, n=10, m=None, n0=34, k=100, k_top=10, k_g
 
         ind = jnp.argsort(y, kind='stable')
         ind = (ind[::-1] if is_max else ind)[:k_top]
-
         for _ in range(k_gd):
             state, P = optimize(state, P, I[ind, :])
-
+            
+        
         info['t'] = tpc() - time
         _log(info, log, is_new)
 
     info['t'] = tpc() - time
     _log(info, log, is_new, is_end=True)
 
-    return info['i_opt'], info['y_opt']
+    return info['i_opt'], info['y_opt'], info["ll_list"]
 
 
 def _likelihood(P, I):
 
     """Compute the likelihood of sequence i for decicoder model."""
-    y = jnp.cumsum(jax.nn.log_softmax(P, axis=-1), axis=1) #[:, -1]
+    #     y = jnp.cumsum(jax.nn.log_softmax(P, axis=-1), axis=1) #[:, -1]
+    y = jax.nn.log_softmax(P, axis=-1)
     probs = jnp.zeros_like(I)
+
     # Y from 0 to 9
     # try to swap this cycle with jax.lax.scan
     for i in range(len(I)):
@@ -107,21 +114,25 @@ def _likelihood(P, I):
     return probs
 
 
+
 def _generate_initial(k, d, n,  key):
     keyl, _ = jax.random.split(key, 2)
     P = jax.random.uniform(keyl, (k, d, n))
     return P
 
+# def _sample(P, key):
+#     print(P[0])
+#     i = jax.random.choice(key, jnp.arange(P.shape[-1]), p=P[0], shape=(1,))
+#     return i
+# sample = jax.jit(jax.vmap(_sample, (0, None)))
+
+
 def _sample(P, key):
-    print(P[0])
-    i = jax.random.choice(key, jnp.arange(P.shape[-1]), p=P[0], shape=(1,))
+    i = jax.random.choice(key, P.shape[-1], p=P)
     return i
-# keys=
+# sample = jax.jit(jax.vmap(_sample, (0, 0)))
+
 # jax.debug
-sample = jax.jit(jax.vmap(_sample, (0, None)))
-
-
-# разные keys, разные сэмплы
 
 
 
