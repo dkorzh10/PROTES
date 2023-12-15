@@ -11,7 +11,6 @@ import numpy as np
 def protes_gpt(f, model, tokenizer, d, n=10, m=None, n0=34, k=100, k_top=10, k_gd=1, lr=5.E-2, r=5, seed=0,
            is_max=False, log=False, info={}, P=None,
            with_info_i_opt_list=False, with_info_full=False):
-#     assert n == 10
     assert k == 1
     
 
@@ -33,10 +32,8 @@ def protes_gpt(f, model, tokenizer, d, n=10, m=None, n0=34, k=100, k_top=10, k_g
     optim = optax.adam(lr)
     state = optim.init(P)
 
-#     sample = jax.jit(jax.vmap(_sample, (None, 0)))
     sample = jax.jit(jax.vmap(_sample, (0, 0)))
     likelihood = jax.jit(jax.vmap(_likelihood, (None, 0)))
-
 
     @jax.jit
     def loss(P_cur, I_cur):
@@ -51,62 +48,74 @@ def protes_gpt(f, model, tokenizer, d, n=10, m=None, n0=34, k=100, k_top=10, k_g
         updates, state = optim.update(grads, state)
         P_cur = jax.tree_util.tree_map(lambda p, u: p + u, P_cur, updates)
         return state, P_cur
-
-#     I = sample(P[:, 0], jax.random.split(key, k))
+    
     I = sample(P[0], jax.random.split(key, d))
     I = I[None, :]
+
     while True:
-        q = np.array(I + n0)  # [None, :]
+        P_normalized = jax.nn.softmax(P, axis=-1)
+#         I = sample(Pp[0], jax.random.split(key, d))[None, :]
+        I = sample(P_normalized[0], jax.random.split(key, d))[None, :]
+#         jax.debug.print("Pp {x} 🤯", x=Pp)
+#         jax.debug.print("I {x} 🤯", x=I)
+
+        q = np.array(I + n0)
         q = torch.tensor(q).to(model.device)
         with torch.no_grad():
             logits = model(q).logits
-        P = softmax(logits[:, :, n0:n0+n], dim=-1)
-        # batch x d x n
-
-        rng, key = jax.random.split(rng)
-        P = jnp.array(P.cpu().detach().numpy())
-
-#         I = sample(P[:, 0], jax.random.split(key, k))
+        z = softmax(logits[:, :, n0:n0+n], dim=-1)
+        z = jnp.array(z.cpu().detach().numpy())
         
-        I = sample(P[0], jax.random.split(key, d))[None, :]
+        rng, key = jax.random.split(rng)
+        
+        I = sample(z[0], jax.random.split(key, d))[None, :]
         y = f(I)
         if y is None:
             break
 
         y = jnp.array(y)
         info['m'] += y.shape[0]
-        l = likelihood(P, I)
+        l = likelihood(P_normalized, I)
         l = jnp.mean(-l)
         info["ll_list"].append(l)
-        is_new = _process(P, I, y, info, with_info_i_opt_list, with_info_full)
+        is_new = _process(P_normalized, I, y, info, with_info_i_opt_list, with_info_full)
 
         if info['m_max'] and info['m'] >= info['m_max']:
             break
 
         ind = jnp.argsort(y, kind='stable')
         ind = (ind[::-1] if is_max else ind)[:k_top]
+
+
+
         for _ in range(k_gd):
             state, P = optimize(state, P, I[ind, :])
             
-        
         info['t'] = tpc() - time
         _log(info, log, is_new)
 
     info['t'] = tpc() - time
     _log(info, log, is_new, is_end=True)
 
-    return info['i_opt'], info['y_opt'], info["ll_list"]
+    return info['i_opt'], info['y_opt'], info["ll_list"], P
 
 
 def _likelihood(P, I):
-
     """Compute the likelihood of sequence i for decicoder model."""
-    #     y = jnp.cumsum(jax.nn.log_softmax(P, axis=-1), axis=1) #[:, -1]
-    y = jax.nn.log_softmax(P, axis=-1)
+
+# лишний софтмас
+#     jax.debug.print("P in _likelihood {x} 🤯", x=(P < 0).any())
+#     y = jax.nn.log_softmax(P, axis=-1)
+    y = jnp.log(P)
+
+#     y = jnp.log(P - jnp.mean(P, axis=-1, keepdims=True))  # lol works with negtive numbers and NaNs
+#     jax.debug.print("P {x} 🤯", x=P)
+#     y = jax.nn.softmax(P, axis=-1)
+#     jax.debug.print("🤯 {x} 🤯", x=y)
     probs = jnp.zeros_like(I)
 
     # Y from 0 to 9
-    # try to swap this cycle with jax.lax.scan
+    # try to swap this cycle with jax.lax.scan or with einsum
     for i in range(len(I)):
         probs += y[:, i, I[i]]
 
@@ -114,26 +123,18 @@ def _likelihood(P, I):
     return probs
 
 
-
+#  будущее
+# записать распр
+# generate
 def _generate_initial(k, d, n,  key):
     keyl, _ = jax.random.split(key, 2)
     P = jax.random.uniform(keyl, (k, d, n))
     return P
 
-# def _sample(P, key):
-#     print(P[0])
-#     i = jax.random.choice(key, jnp.arange(P.shape[-1]), p=P[0], shape=(1,))
-#     return i
-# sample = jax.jit(jax.vmap(_sample, (0, None)))
-
 
 def _sample(P, key):
     i = jax.random.choice(key, P.shape[-1], p=P)
     return i
-# sample = jax.jit(jax.vmap(_sample, (0, 0)))
-
-# jax.debug
-
 
 
 def _log(info, log=False, is_new=False, is_end=False):

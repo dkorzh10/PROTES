@@ -11,7 +11,7 @@ def protes(f, d, n, m=None, k=100, k_top=10, k_gd=1, lr=5.E-2, r=5, seed=0,
     info.update({'d': d, 'n': n, 'm_max': m, 'm': 0, 'k': k, 'k_top': k_top,
         'k_gd': k_gd, 'lr': lr, 'r': r, 'seed': seed, 'is_max': is_max,
         'is_rand': P is None, 't': 0, 'i_opt': None, 'y_opt': None,
-        'm_opt_list': [], 'i_opt_list': [], 'y_opt_list': []})
+        'm_opt_list': [], 'i_opt_list': [], 'y_opt_list': [], "ll_list": []})
     if with_info_full:
         info.update({
             'P_list': [], 'I_list': [], 'y_list': []})
@@ -64,6 +64,11 @@ def protes(f, d, n, m=None, k=100, k_top=10, k_gd=1, lr=5.E-2, r=5, seed=0,
 
         if info['m_max'] and info['m'] >= info['m_max']:
             break
+            
+        Pl, Pm, Pr = P
+        Zm = interface_matrices(Pm, Pr)
+        l = likelihood(Pl, Pm, Pr, Zm, I)
+        info["ll_list"].append(l)
 
         ind = jnp.argsort(y, kind='stable')
         ind = (ind[::-1] if is_max else ind)[:k_top]
@@ -77,7 +82,7 @@ def protes(f, d, n, m=None, k=100, k_top=10, k_gd=1, lr=5.E-2, r=5, seed=0,
     info['t'] = tpc() - time
     _log(info, log, is_new, is_end=True)
 
-    return info['i_opt'], info['y_opt']
+    return info['i_opt'], info['y_opt'], info["ll_list"]
 
 
 def _generate_initial(d, n, r, key):
